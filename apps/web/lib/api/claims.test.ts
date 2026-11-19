@@ -107,18 +107,30 @@ describe("buildClaim: Solana", () => {
     }),
   };
 
-  it("opens the recipient's account first when it is missing", async () => {
-    const { steps } = await svc({
+  it("returns only open_account when the recipient account is missing, then claim after it exists", async () => {
+    const first = await svc({
       ...toSolana,
-      solanaClaim: async () => ({ state: "ready", setup: "c2V0dXA=", mint: "bWludA==" }),
+      solanaClaim: async () => ({ state: "ready", setup: "c2V0dXA=", mint: null }),
     }).buildClaim({
       chain: "stellar",
       tx: STELLAR_TX,
       payer: SOLANA_WALLET,
       recipientOwner: SOLANA_WALLET,
     });
-    expect(steps.map((s) => [s.id, s.tx])).toEqual([
+    expect(first.steps.map((s) => [s.id, s.tx])).toEqual([
       ["open_account", { kind: "solana", transaction: "c2V0dXA=" }],
+    ]);
+
+    const second = await svc({
+      ...toSolana,
+      solanaClaim: async () => ({ state: "ready", setup: null, mint: "bWludA==" }),
+    }).buildClaim({
+      chain: "stellar",
+      tx: STELLAR_TX,
+      payer: SOLANA_WALLET,
+      recipientOwner: SOLANA_WALLET,
+    });
+    expect(second.steps.map((s) => [s.id, s.tx])).toEqual([
       ["claim", { kind: "solana", transaction: "bWludA==" }],
     ]);
   });
