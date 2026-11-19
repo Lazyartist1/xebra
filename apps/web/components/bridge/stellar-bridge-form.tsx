@@ -26,6 +26,7 @@ import {
   getWrapperFeeParams,
   quoteBridge,
   submitBridge,
+  waitForTx,
 } from "../../lib/cctp-bridge";
 import { type DeliveryView, getDelivery, getRouteHealth } from "../../lib/circle-status";
 import { env, isCctpRailConfigured } from "../../lib/env";
@@ -34,6 +35,7 @@ import { unitsToInput } from "../../lib/max-amount";
 import { type RecipientResolution, resolveRecipient } from "../../lib/solana-recipient";
 import { Button } from "../ui/button";
 import { Field, Input } from "../ui/field";
+import { InsetTray } from "../ui/glass-card";
 import { ArrowRight } from "../ui/icons";
 import { Notice } from "../ui/notice";
 import { StripeRule } from "../ui/stripe-rule";
@@ -41,7 +43,7 @@ import { useWallets } from "../wallet/wallet-provider";
 import { BeneficiaryPicker } from "./beneficiary-picker";
 import { ChainPicker, PickerLabel } from "./chain-picker";
 import { MaxAmount, QUICK_AMOUNTS, QuickAmount } from "./quick-amount";
-import { SubmittedNotice } from "./receipt";
+import { CopyButton, SubmittedNotice } from "./receipt";
 import { ArcRecipientPanel, RecipientPanel, UseMyWallet } from "./recipient-panels";
 import { RouteTrack } from "./route-track";
 import { QuotePanel } from "./stellar-quote-panel";
@@ -96,6 +98,84 @@ const CONSECUTIVE_POLL_FAILURES_THRESHOLD = 5;
 /** Backoff interval when consecutive poll failures occur. */
 const POLL_BACKOFF_MS = 30_000;
 
+export type StellarWaitOutcome = "confirmed" | "failed" | "timeout";
+
+export type StellarBurnReceiptState =
+  | {
+      kind: "burned";
+      txHash: string;
+      explorerUrl: string;
+      pollCircle: true;
+    }
+  | {
+      kind: "failed";
+      txHash: string;
+      explorerUrl: string;
+      message: string;
+      pollCircle: false;
+    }
+  | {
+      kind: "waiting-stellar";
+      txHash: string;
+      explorerUrl: string;
+      statusText: "Waiting for Stellar to confirm";
+      pollCircle: false;
+    };
+
+/** Builds the stellar.expert transaction URL for the configured Stellar network. */
+export function stellarExplorerTxUrl(txHash: string, networkPassphrase?: string): string {
+  const network = networkPassphrase?.includes("Test SDF") ? "testnet" : "public";
+  return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
+}
+
+/** Classifies a `waitForTx` failure as an on-chain rejection or an unresolved confirmation wait. */
+export function classifyStellarWaitError(err: unknown): Exclude<StellarWaitOutcome, "confirmed"> {
+  if (err instanceof Error && err.message.includes("was included in a ledger but failed")) {
+    return "failed";
+  }
+  return "timeout";
+}
+
+/**
+ * Maps a `PENDING` (or `DUPLICATE`) Soroban submit and its confirmation outcome into the form's
+ * receipt state so failed burns re-enable retry and timed-out waits never blame Circle.
+ */
+export function mapStellarBurnResult(
+  submitStatus: "PENDING" | "DUPLICATE",
+  outcome: StellarWaitOutcome,
+  txHash: string,
+  networkPassphrase?: string,
+): StellarBurnReceiptState {
+  void submitStatus;
+  const explorerUrl = stellarExplorerTxUrl(txHash, networkPassphrase);
+  switch (outcome) {
+    case "confirmed":
+      return {
+        kind: "burned",
+        txHash,
+        explorerUrl,
+        pollCircle: true,
+      };
+    case "failed":
+      return {
+        kind: "failed",
+        txHash,
+        explorerUrl,
+        message:
+          "Stellar did not accept the burn. No USDC left your wallet. Only the network fee was spent.",
+        pollCircle: false,
+      };
+    case "timeout":
+      return {
+        kind: "waiting-stellar",
+        txHash,
+        explorerUrl,
+        statusText: "Waiting for Stellar to confirm",
+        pollCircle: false,
+      };
+  }
+}
+
 export function StellarBridgeForm({
   sourcePicker,
   onBusyChange,
@@ -132,7 +212,12 @@ export function StellarBridgeForm({
   const [submitting, setSubmitting] = useState(false);
   const [step, setStep] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [txHash, setTxHash] = useState<string | null>(null);
+  const [burnReceipt, setBurnReceipt] = useState<StellarBurnReceiptState | null>(null);
+  const txHash =
+    burnReceipt && (burnReceipt.kind === "burned" || burnReceipt.kind === "waiting-stellar")
+      ? burnReceipt.txHash
+      : null;
+  const confirmedTxHash = burnReceipt?.kind === "burned" ? burnReceipt.txHash : null;
   // Circle's own account of the transfer. `null` until the first answer.
   const [delivery, setDelivery] = useState<DeliveryView | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -420,7 +505,7 @@ export function StellarBridgeForm({
   // Circle reports the transfer delivered, failed, or claimable. The server budgets and caches
   // these lookups, so a long wait costs Circle's rate limit almost nothing.
   useEffect(() => {
-    if (!txHash) {
+    if (!confirmedTxHash) {
       setDelivery(null);
       setPollError(null);
       setStalled(false);
@@ -432,7 +517,7 @@ export function StellarBridgeForm({
     const startedAt = Date.now();
 
     const poll = async () => {
-      const result = await getDelivery(txHash);
+      const result = await getDelivery(confirmedTxHash);
       if (cancelled) return;
 
       if (result.status === "known") {
@@ -473,7 +558,7 @@ export function StellarBridgeForm({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [txHash]);
+  }, [confirmedTxHash]);
 
   // Ask whether Circle can carry this transfer before anyone is invited to sign it.
   //
@@ -563,6 +648,7 @@ export function StellarBridgeForm({
     if ((id === "solana") !== (destId === "solana")) setDestination("");
     setDestId(id);
     setSubmitError(null);
+    setBurnReceipt((prev) => (prev?.kind === "failed" ? null : prev));
   }
 
   const connect = useCallback(() => openWallets(["stellar", "solana", "evm"]), [openWallets]);
@@ -592,7 +678,7 @@ export function StellarBridgeForm({
     setSubmitting(true);
     setSentTo(destId);
     setSubmitError(null);
-    setTxHash(null);
+    setBurnReceipt(null);
     setPollError(null);
     setStalled(false);
     try {
@@ -689,12 +775,30 @@ export function StellarBridgeForm({
         // contract rejects rather than charging more than was displayed.
         maxWrapperFee: quote.fee,
       });
-      // The burn is on chain and irreversible from here. Circle attests it and its forwarding
-      // service mints on the destination; the effect above watches for the outcome.
-      setTxHash(hash);
-      // Remembered once the burn is on chain, not when the field is filled: only an address that was
-      // actually sent to belongs in the list.
-      book.remember(dest.evm ? "evm" : "solana", destination);
+      // Soroban `PENDING` only guarantees queueing. Wait for Horizon ledger confirmation before
+      // handing the hash to Circle so an on-chain `FAILED` tx never sits at "Waiting for Circle".
+      setStep("Waiting for Stellar to confirm");
+      let waitOutcome: StellarWaitOutcome = "confirmed";
+      try {
+        await waitForTx(config, hash);
+      } catch (waitErr) {
+        waitOutcome = classifyStellarWaitError(waitErr);
+        if (waitOutcome === "failed") {
+          reportError("stellar burn failed on chain", waitErr);
+        }
+      }
+      const nextReceipt = mapStellarBurnResult(
+        "PENDING",
+        waitOutcome,
+        hash,
+        env.stellarNetworkPassphrase,
+      );
+      setBurnReceipt(nextReceipt);
+      if (nextReceipt.kind === "burned") {
+        // Remembered once the burn is on chain, not when the field is filled: only an address that was
+        // actually sent to belongs in the list.
+        book.remember(dest.evm ? "evm" : "solana", destination);
+      }
     } catch (err) {
       setSubmitError(reportError("transfer failed", err));
     } finally {
@@ -866,6 +970,22 @@ export function StellarBridgeForm({
           </Notice>
         )}
 
+        {burnReceipt?.kind === "failed" && (
+          <Notice tone="alarm" title="Stellar did not accept the burn" className="mt-5">
+            <p>{burnReceipt.message}</p>
+            <p className="mt-2">
+              <a
+                href={burnReceipt.explorerUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-bone/70 underline decoration-bone/25 underline-offset-[3px] transition-colors duration-200 ease-haptic hover:text-bone hover:decoration-bone/50"
+              >
+                View transaction on stellar.expert
+              </a>
+            </p>
+          </Notice>
+        )}
+
         {submitError && (
           <Notice tone="alarm" title="The transfer did not go through" className="mt-5">
             {/* A Soroban failure's useful part is its diagnostic event log, which is
@@ -900,12 +1020,13 @@ export function StellarBridgeForm({
           </p>
         )}
 
-        {txHash ? (
+        {burnReceipt?.kind === "burned" ? (
           <>
             <SubmittedNotice
-              txHash={txHash}
+              txHash={burnReceipt.txHash}
               delivery={delivery}
               destination={stellarDestination(sentTo)}
+              route={{ burnUrl: burnReceipt.explorerUrl }}
             />
             {pollError && !stalled && (
               <Notice tone="alarm" title={pollError} className="mt-3">
@@ -923,7 +1044,7 @@ export function StellarBridgeForm({
                 <p className="mt-1.5">
                   You can track or complete the transfer on the{" "}
                   <a
-                    href={`/claim?tx=${encodeURIComponent(txHash)}`}
+                    href={`/claim?tx=${encodeURIComponent(burnReceipt.txHash)}`}
                     className="underline underline-offset-2 hover:text-bone"
                   >
                     claim page
@@ -933,6 +1054,32 @@ export function StellarBridgeForm({
               </Notice>
             )}
           </>
+        ) : burnReceipt?.kind === "waiting-stellar" ? (
+          <div className="mt-6">
+            <Notice tone="info" title={burnReceipt.statusText}>
+              The transaction was submitted to Stellar and is still awaiting ledger confirmation.
+            </Notice>
+            <InsetTray className="mt-2.5 py-3">
+              <div className="flex items-center gap-3">
+                <span className="tabular min-w-0 flex-1 truncate font-mono text-xs text-bone/45">
+                  {burnReceipt.txHash}
+                </span>
+                <a
+                  href={burnReceipt.explorerUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="shrink-0 text-xs text-bone/70 underline decoration-bone/25 underline-offset-[3px] transition-colors duration-200 ease-haptic hover:text-bone hover:decoration-bone/50"
+                >
+                  View
+                </a>
+                <CopyButton value={burnReceipt.txHash} label="transaction hash" />
+              </div>
+              <p className="mt-2.5 flex items-center gap-2 border-t border-bone/[0.06] pt-2.5 text-[0.75rem] text-bone/45">
+                <span className="h-1 w-1 shrink-0 rounded-full bg-signal animate-breathe" />
+                {burnReceipt.statusText}
+              </p>
+            </InsetTray>
+          </div>
         ) : (
           <Button
             size="lg"
