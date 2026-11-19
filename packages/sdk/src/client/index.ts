@@ -128,7 +128,13 @@ export function createXebraClient(opts: XebraClientOptions = {}) {
       });
     } catch (err) {
       if (timeout.aborted)
-        throw new XebraApiError(0, "timeout", `No answer within ${timeoutMs} ms.`, {}, { cause: err });
+        throw new XebraApiError(
+          0,
+          "timeout",
+          `No answer within ${timeoutMs} ms.`,
+          {},
+          { cause: err },
+        );
       if (init.signal?.aborted) throw err;
       throw new XebraApiError(
         0,
