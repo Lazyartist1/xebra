@@ -41,7 +41,12 @@ describe("mapStellarBurnResult", () => {
 
   it("maps a wait timeout to 'Waiting for Stellar to confirm' rather than polling Circle", () => {
     expect(
-      mapStellarBurnResult("PENDING", "timeout", SAMPLE_TX_HASH, "Test SDF Network ; September 2015"),
+      mapStellarBurnResult(
+        "PENDING",
+        "timeout",
+        SAMPLE_TX_HASH,
+        "Test SDF Network ; September 2015",
+      ),
     ).toEqual({
       kind: "waiting-stellar",
       txHash: SAMPLE_TX_HASH,
