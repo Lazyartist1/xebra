@@ -176,6 +176,29 @@ export function mapStellarBurnResult(
   }
 }
 
+/**
+ * Re-checks Horizon when a burn stays in `waiting-stellar` after the initial wait timed out,
+ * returning the updated receipt state so late confirmations start Circle polling and late failures
+ * surface and unlock the form.
+ */
+export async function pollPendingStellarBurn(
+  horizonConfig: Pick<BridgeChainConfig, "horizonUrl">,
+  txHash: string,
+  networkPassphrase?: string,
+  waitFn: typeof waitForTx = waitForTx,
+): Promise<StellarBurnReceiptState> {
+  try {
+    await waitFn(horizonConfig, txHash, 15_000, 3_000);
+    return mapStellarBurnResult("PENDING", "confirmed", txHash, networkPassphrase);
+  } catch (err) {
+    const outcome = classifyStellarWaitError(err);
+    if (outcome === "failed") {
+      reportError("stellar burn failed on chain", err);
+    }
+    return mapStellarBurnResult("PENDING", outcome, txHash, networkPassphrase);
+  }
+}
+
 export function StellarBridgeForm({
   sourcePicker,
   onBusyChange,
@@ -502,6 +525,39 @@ export function StellarBridgeForm({
   // Without this the receipt could only ever say "waiting", with nothing to end it — a spinner
   // that never resolves, which is a worse thing to show someone than a wrong error. It asks every
   // five seconds for the first two minutes and every fifteen after that, and stops as soon as
+  // When initial confirmation timed out, keep polling Horizon so a burn that lands late promotes
+  // to `burned` (starting Circle delivery tracking) rather than leaving the receipt stuck forever.
+  useEffect(() => {
+    if (burnReceipt?.kind !== "waiting-stellar") return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const horizonUrl = config.horizonUrl;
+
+    const recheck = async () => {
+      const next = await pollPendingStellarBurn(
+        { horizonUrl },
+        burnReceipt.txHash,
+        env.stellarNetworkPassphrase,
+      );
+      if (cancelled) return;
+      if (next.kind === "burned" || next.kind === "failed") {
+        setBurnReceipt(next);
+        if (next.kind === "burned") {
+          const target = stellarDestination(sentTo);
+          book.remember(target.evm ? "evm" : "solana", destination);
+        }
+        return;
+      }
+      timer = setTimeout(recheck, 5_000);
+    };
+
+    timer = setTimeout(recheck, 5_000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [burnReceipt, config.horizonUrl, sentTo, destination, book]);
+
   // Circle reports the transfer delivered, failed, or claimable. The server budgets and caches
   // these lookups, so a long wait costs Circle's rate limit almost nothing.
   useEffect(() => {
@@ -1077,6 +1133,16 @@ export function StellarBridgeForm({
               <p className="mt-2.5 flex items-center gap-2 border-t border-bone/[0.06] pt-2.5 text-[0.75rem] text-bone/45">
                 <span className="h-1 w-1 shrink-0 rounded-full bg-signal animate-breathe" />
                 {burnReceipt.statusText}
+              </p>
+              <p className="mt-2.5 border-t border-bone/[0.06] pt-2.5 text-[0.75rem] text-bone/45">
+                You can track or complete the transfer on the{" "}
+                <a
+                  href={`/claim?tx=${encodeURIComponent(burnReceipt.txHash)}`}
+                  className="underline underline-offset-2 hover:text-bone"
+                >
+                  claim page
+                </a>
+                .
               </p>
             </InsetTray>
           </div>

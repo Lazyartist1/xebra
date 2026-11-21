@@ -13,6 +13,7 @@ vi.mock("./use-beneficiaries", () => ({ useBeneficiaries: () => ({}) }));
 import {
   classifyStellarWaitError,
   mapStellarBurnResult,
+  pollPendingStellarBurn,
   stellarExplorerTxUrl,
 } from "./stellar-bridge-form";
 
@@ -88,5 +89,69 @@ describe("stellarExplorerTxUrl", () => {
     expect(stellarExplorerTxUrl(SAMPLE_TX_HASH)).toBe(
       `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
     );
+  });
+});
+
+describe("pollPendingStellarBurn", () => {
+  it("Horizon slow, then confirms: keeps waiting-stellar until confirmed, then promotes to burned for Circle polling", async () => {
+    const waitFn = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(`Timed out after 15s waiting for ${SAMPLE_TX_HASH} to be applied.`),
+      )
+      .mockResolvedValueOnce(undefined);
+
+    const first = await pollPendingStellarBurn(
+      { horizonUrl: "https://horizon.stellar.org" },
+      SAMPLE_TX_HASH,
+      "Public Global Stellar Network ; September 2015",
+      waitFn,
+    );
+    expect(first).toEqual({
+      kind: "waiting-stellar",
+      txHash: SAMPLE_TX_HASH,
+      explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
+      statusText: "Waiting for Stellar to confirm",
+      pollCircle: false,
+    });
+
+    const second = await pollPendingStellarBurn(
+      { horizonUrl: "https://horizon.stellar.org" },
+      SAMPLE_TX_HASH,
+      "Public Global Stellar Network ; September 2015",
+      waitFn,
+    );
+    expect(second).toEqual({
+      kind: "burned",
+      txHash: SAMPLE_TX_HASH,
+      explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
+      pollCircle: true,
+    });
+    expect(waitFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("Horizon slow, then fails on chain: transitions to failed notice instead of staying stuck waiting", async () => {
+    const waitFn = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          `Transaction ${SAMPLE_TX_HASH} was included in a ledger but failed. Nothing has moved.`,
+        ),
+      );
+
+    const next = await pollPendingStellarBurn(
+      { horizonUrl: "https://horizon.stellar.org" },
+      SAMPLE_TX_HASH,
+      "Public Global Stellar Network ; September 2015",
+      waitFn,
+    );
+    expect(next).toEqual({
+      kind: "failed",
+      txHash: SAMPLE_TX_HASH,
+      explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
+      message:
+        "Stellar did not accept the burn. No USDC left your wallet. Only the network fee was spent.",
+      pollCircle: false,
+    });
   });
 });
