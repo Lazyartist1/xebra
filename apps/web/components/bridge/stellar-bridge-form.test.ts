@@ -10,8 +10,9 @@ vi.mock("../wallet/wallet-provider", () => ({ useWallets: () => ({}) }));
 vi.mock("./beneficiary-picker", () => ({ BeneficiaryPicker: () => null }));
 vi.mock("./use-beneficiaries", () => ({ useBeneficiaries: () => ({}) }));
 
+import { StellarTxNotFoundError, txMaxTimeMs, waitForTx } from "../../lib/cctp-bridge";
 import {
-  STELLAR_BURN_TIMEBOUND_MS,
+  HORIZON_INGEST_GRACE_MS,
   STELLAR_RECHECK_MAX_ROUNDS,
   classifyStellarWaitError,
   mapStellarBurnResult,
@@ -165,21 +166,23 @@ describe("pollPendingStellarBurn", () => {
     });
   });
 
-  it("stops re-checking once the round cap or transaction time bound is reached and marks the burn not-sent with the hash", async () => {
+  const HORIZON = { horizonUrl: "https://horizon.stellar.org" };
+  const PUBLIC = "Public Global Stellar Network ; September 2015";
+  const MAX_TIME_MS = 1_700_000_120_000;
+  const SETTLED_MS = MAX_TIME_MS + HORIZON_INGEST_GRACE_MS;
+
+  it("marks the burn not-sent only when Horizon answered 404 after the transaction's time bound", async () => {
     const waitFn = vi
       .fn()
       .mockRejectedValue(
-        new Error(`Timed out after 15s waiting for ${SAMPLE_TX_HASH} to be applied.`),
+        new StellarTxNotFoundError("timed out", SAMPLE_TX_HASH, SETTLED_MS + 1_000),
       );
-
-    const byRoundCap = await pollPendingStellarBurn(
-      { horizonUrl: "https://horizon.stellar.org" },
-      SAMPLE_TX_HASH,
-      "Public Global Stellar Network ; September 2015",
-      waitFn,
-      { round: STELLAR_RECHECK_MAX_ROUNDS, maxRounds: STELLAR_RECHECK_MAX_ROUNDS },
-    );
-    expect(byRoundCap).toEqual({
+    const next = await pollPendingStellarBurn(HORIZON, SAMPLE_TX_HASH, PUBLIC, waitFn, {
+      round: 1,
+      deadlineMs: MAX_TIME_MS,
+      nowMs: SETTLED_MS + 2_000,
+    });
+    expect(next).toEqual({
       kind: "not-sent",
       txHash: SAMPLE_TX_HASH,
       explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
@@ -187,21 +190,116 @@ describe("pollPendingStellarBurn", () => {
         "Stellar did not confirm the burn before its time bound expired, so it was not sent. No USDC left your wallet. It is safe to try again.",
       pollCircle: false,
     });
+  });
 
-    const startMs = 1_000_000;
-    const byTimebound = await pollPendingStellarBurn(
-      { horizonUrl: "https://horizon.stellar.org" },
-      SAMPLE_TX_HASH,
-      "Public Global Stellar Network ; September 2015",
-      waitFn,
-      {
-        round: 1,
+  it("keeps waiting while the time bound is still open, even on a 404 and an exhausted round count", async () => {
+    const waitFn = vi
+      .fn()
+      .mockRejectedValue(new StellarTxNotFoundError("timed out", SAMPLE_TX_HASH, MAX_TIME_MS - 1));
+    const next = await pollPendingStellarBurn(HORIZON, SAMPLE_TX_HASH, PUBLIC, waitFn, {
+      round: STELLAR_RECHECK_MAX_ROUNDS,
+      maxRounds: STELLAR_RECHECK_MAX_ROUNDS,
+      deadlineMs: MAX_TIME_MS,
+      nowMs: MAX_TIME_MS - 1,
+    });
+    expect(next).toMatchObject({ kind: "waiting-stellar", deadlineMs: MAX_TIME_MS });
+  });
+
+  it("never says not-sent when a 404 came before the bound plus Horizon's ingest grace", async () => {
+    const waitFn = vi
+      .fn()
+      .mockRejectedValue(new StellarTxNotFoundError("timed out", SAMPLE_TX_HASH, MAX_TIME_MS + 1));
+    const next = await pollPendingStellarBurn(HORIZON, SAMPLE_TX_HASH, PUBLIC, waitFn, {
+      round: STELLAR_RECHECK_MAX_ROUNDS,
+      maxRounds: STELLAR_RECHECK_MAX_ROUNDS,
+      deadlineMs: MAX_TIME_MS,
+      nowMs: SETTLED_MS + 2_000,
+    });
+    expect(next.kind).toBe("unconfirmed");
+  });
+
+  it("is unconfirmed, never not-sent, when every Horizon call fails", async () => {
+    // Real waitForTx, short timings, against a Horizon that cannot be reached and then one that 503s.
+    const fastWait: typeof waitForTx = (config, txHash) => waitForTx(config, txHash, 30, 5);
+    const failures: Array<() => Promise<Response>> = [
+      () => Promise.reject(new TypeError("fetch failed")),
+      () => Promise.resolve(new Response("unavailable", { status: 503 })),
+    ];
+    for (const fail of failures) {
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(fail));
+      for (const options of [
+        { round: 1, deadlineMs: MAX_TIME_MS, nowMs: SETTLED_MS + 2_000 },
+        {
+          round: STELLAR_RECHECK_MAX_ROUNDS,
+          maxRounds: STELLAR_RECHECK_MAX_ROUNDS,
+          deadlineMs: MAX_TIME_MS,
+          nowMs: SETTLED_MS + 2_000,
+        },
+        { round: STELLAR_RECHECK_MAX_ROUNDS, maxRounds: STELLAR_RECHECK_MAX_ROUNDS },
+      ]) {
+        const next = await pollPendingStellarBurn(
+          HORIZON,
+          SAMPLE_TX_HASH,
+          PUBLIC,
+          fastWait,
+          options,
+        );
+        expect(next.kind).not.toBe("not-sent");
+        expect(next.txHash).toBe(SAMPLE_TX_HASH);
+      }
+      const exhausted = await pollPendingStellarBurn(HORIZON, SAMPLE_TX_HASH, PUBLIC, fastWait, {
+        round: STELLAR_RECHECK_MAX_ROUNDS,
         maxRounds: STELLAR_RECHECK_MAX_ROUNDS,
-        deadlineMs: startMs + STELLAR_BURN_TIMEBOUND_MS,
-        nowMs: startMs + STELLAR_BURN_TIMEBOUND_MS,
-      },
+        deadlineMs: MAX_TIME_MS,
+        nowMs: SETTLED_MS + 2_000,
+      });
+      expect(exhausted).toMatchObject({ kind: "unconfirmed", txHash: SAMPLE_TX_HASH });
+      if (exhausted.kind === "unconfirmed") {
+        expect(exhausted.message).toMatch(/stellar\.expert before trying again/);
+        expect(exhausted.message).not.toMatch(/safe to try again/);
+      }
+    }
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("waitForTx", () => {
+  it("throws StellarTxNotFoundError only when Horizon's latest answer was a 404", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
+    const notFound = await waitForTx({ horizonUrl: "https://h.example" }, "tx1", 30, 5).catch(
+      (e: unknown) => e,
     );
-    expect(byTimebound.kind).toBe("not-sent");
-    expect(byTimebound.txHash).toBe(SAMPLE_TX_HASH);
+    expect(notFound).toBeInstanceOf(StellarTxNotFoundError);
+
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("", { status: 404 }))
+        .mockRejectedValue(new TypeError("fetch failed")),
+    );
+    const unreachable = await waitForTx({ horizonUrl: "https://h.example" }, "tx1", 30, 5).catch(
+      (e: unknown) => e,
+    );
+    expect(unreachable).toBeInstanceOf(Error);
+    expect(unreachable).not.toBeInstanceOf(StellarTxNotFoundError);
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("txMaxTimeMs", () => {
+  it("reads the signed transaction's maxTime, and treats 0 as no bound", () => {
+    type Tx = Parameters<typeof txMaxTimeMs>[0];
+    expect(
+      txMaxTimeMs({ timeBounds: { minTime: "0", maxTime: "1700000120" } } as unknown as Tx),
+    ).toBe(1_700_000_120_000);
+    expect(
+      txMaxTimeMs({ timeBounds: { minTime: "0", maxTime: "0" } } as unknown as Tx),
+    ).toBeUndefined();
+    expect(
+      txMaxTimeMs({
+        innerTransaction: { timeBounds: { minTime: "0", maxTime: "1700000060" } },
+      } as unknown as Tx),
+    ).toBe(1_700_000_060_000);
   });
 });
