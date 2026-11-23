@@ -97,8 +97,12 @@ const POLL_CAP_MS = 30 * 60_000;
 const CONSECUTIVE_POLL_FAILURES_THRESHOLD = 5;
 /** Backoff interval when consecutive poll failures occur. */
 const POLL_BACKOFF_MS = 30_000;
+/** How long a built Stellar burn transaction's time bound stays open (`TX_TIMEOUT_SECS = 120` in `@xebra/sdk/build`). */
+export const STELLAR_BURN_TIMEBOUND_MS = 120_000;
+/** Maximum Horizon re-check rounds in `waiting-stellar` (each waits up to 15 s after a 5 s pause) before declaring the burn not sent. */
+export const STELLAR_RECHECK_MAX_ROUNDS = 6;
 
-export type StellarWaitOutcome = "confirmed" | "failed" | "timeout";
+export type StellarWaitOutcome = "confirmed" | "failed" | "timeout" | "expired";
 
 export type StellarBurnReceiptState =
   | {
@@ -109,6 +113,13 @@ export type StellarBurnReceiptState =
     }
   | {
       kind: "failed";
+      txHash: string;
+      explorerUrl: string;
+      message: string;
+      pollCircle: false;
+    }
+  | {
+      kind: "not-sent";
       txHash: string;
       explorerUrl: string;
       message: string;
@@ -129,7 +140,9 @@ export function stellarExplorerTxUrl(txHash: string, networkPassphrase?: string)
 }
 
 /** Classifies a `waitForTx` failure as an on-chain rejection or an unresolved confirmation wait. */
-export function classifyStellarWaitError(err: unknown): Exclude<StellarWaitOutcome, "confirmed"> {
+export function classifyStellarWaitError(
+  err: unknown,
+): Exclude<StellarWaitOutcome, "confirmed" | "expired"> {
   if (err instanceof Error && err.message.includes("was included in a ledger but failed")) {
     return "failed";
   }
@@ -137,16 +150,14 @@ export function classifyStellarWaitError(err: unknown): Exclude<StellarWaitOutco
 }
 
 /**
- * Maps a `PENDING` (or `DUPLICATE`) Soroban submit and its confirmation outcome into the form's
- * receipt state so failed burns re-enable retry and timed-out waits never blame Circle.
+ * Maps a Soroban submit's confirmation outcome into the form's receipt state so failed or expired
+ * burns re-enable retry and timed-out waits never blame Circle.
  */
 export function mapStellarBurnResult(
-  submitStatus: "PENDING" | "DUPLICATE",
   outcome: StellarWaitOutcome,
   txHash: string,
   networkPassphrase?: string,
 ): StellarBurnReceiptState {
-  void submitStatus;
   const explorerUrl = stellarExplorerTxUrl(txHash, networkPassphrase);
   switch (outcome) {
     case "confirmed":
@@ -165,6 +176,15 @@ export function mapStellarBurnResult(
           "Stellar did not accept the burn. No USDC left your wallet. Only the network fee was spent.",
         pollCircle: false,
       };
+    case "expired":
+      return {
+        kind: "not-sent",
+        txHash,
+        explorerUrl,
+        message:
+          "Stellar did not confirm the burn before its time bound expired, so it was not sent. No USDC left your wallet. It is safe to try again.",
+        pollCircle: false,
+      };
     case "timeout":
       return {
         kind: "waiting-stellar",
@@ -176,26 +196,42 @@ export function mapStellarBurnResult(
   }
 }
 
+export interface PollPendingStellarBurnOptions {
+  round?: number;
+  maxRounds?: number;
+  deadlineMs?: number;
+  nowMs?: number;
+}
+
 /**
  * Re-checks Horizon when a burn stays in `waiting-stellar` after the initial wait timed out,
- * returning the updated receipt state so late confirmations start Circle polling and late failures
- * surface and unlock the form.
+ * returning the updated receipt state so late confirmations start Circle polling, late failures
+ * surface, and burns whose time bound has expired stop waiting and unlock the form as not sent.
  */
 export async function pollPendingStellarBurn(
   horizonConfig: Pick<BridgeChainConfig, "horizonUrl">,
   txHash: string,
   networkPassphrase?: string,
   waitFn: typeof waitForTx = waitForTx,
+  options?: PollPendingStellarBurnOptions,
 ): Promise<StellarBurnReceiptState> {
   try {
     await waitFn(horizonConfig, txHash, 15_000, 3_000);
-    return mapStellarBurnResult("PENDING", "confirmed", txHash, networkPassphrase);
+    return mapStellarBurnResult("confirmed", txHash, networkPassphrase);
   } catch (err) {
     const outcome = classifyStellarWaitError(err);
     if (outcome === "failed") {
       reportError("stellar burn failed on chain", err);
+      return mapStellarBurnResult("failed", txHash, networkPassphrase);
     }
-    return mapStellarBurnResult("PENDING", outcome, txHash, networkPassphrase);
+    const maxRounds = options?.maxRounds ?? STELLAR_RECHECK_MAX_ROUNDS;
+    const roundsExhausted = options?.round !== undefined && options.round >= maxRounds;
+    const deadlinePassed =
+      options?.deadlineMs !== undefined && (options.nowMs ?? Date.now()) >= options.deadlineMs;
+    if (roundsExhausted || deadlinePassed) {
+      return mapStellarBurnResult("expired", txHash, networkPassphrase);
+    }
+    return mapStellarBurnResult("timeout", txHash, networkPassphrase);
   }
 }
 
@@ -520,27 +556,28 @@ export function StellarBridgeForm({
     dest.name,
   ]);
 
-  // Poll until Circle reports an outcome.
-  //
-  // Without this the receipt could only ever say "waiting", with nothing to end it — a spinner
-  // that never resolves, which is a worse thing to show someone than a wrong error. It asks every
-  // five seconds for the first two minutes and every fifteen after that, and stops as soon as
-  // When initial confirmation timed out, keep polling Horizon so a burn that lands late promotes
-  // to `burned` (starting Circle delivery tracking) rather than leaving the receipt stuck forever.
+  // When initial confirmation timed out, keep polling Horizon until the transaction's time bound
+  // passes so a burn that lands late promotes to `burned` (starting Circle delivery tracking),
+  // while one that never lands stops and unlocks the form as not sent.
   useEffect(() => {
     if (burnReceipt?.kind !== "waiting-stellar") return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    let round = 0;
+    const deadlineMs = Date.now() + STELLAR_BURN_TIMEBOUND_MS;
     const horizonUrl = config.horizonUrl;
 
     const recheck = async () => {
+      round += 1;
       const next = await pollPendingStellarBurn(
         { horizonUrl },
         burnReceipt.txHash,
         env.stellarNetworkPassphrase,
+        waitForTx,
+        { round, maxRounds: STELLAR_RECHECK_MAX_ROUNDS, deadlineMs },
       );
       if (cancelled) return;
-      if (next.kind === "burned" || next.kind === "failed") {
+      if (next.kind !== "waiting-stellar") {
         setBurnReceipt(next);
         if (next.kind === "burned") {
           const target = stellarDestination(sentTo);
@@ -556,8 +593,13 @@ export function StellarBridgeForm({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [burnReceipt, config.horizonUrl, sentTo, destination, book]);
+  }, [burnReceipt, config.horizonUrl, sentTo, destination, book.remember]);
 
+  // Poll until Circle reports an outcome.
+  //
+  // Without this the receipt could only ever say "waiting", with nothing to end it — a spinner
+  // that never resolves, which is a worse thing to show someone than a wrong error. It asks every
+  // five seconds for the first two minutes and every fifteen after that, and stops as soon as
   // Circle reports the transfer delivered, failed, or claimable. The server budgets and caches
   // these lookups, so a long wait costs Circle's rate limit almost nothing.
   useEffect(() => {
@@ -704,7 +746,7 @@ export function StellarBridgeForm({
     if ((id === "solana") !== (destId === "solana")) setDestination("");
     setDestId(id);
     setSubmitError(null);
-    setBurnReceipt((prev) => (prev?.kind === "failed" ? null : prev));
+    setBurnReceipt((prev) => (prev?.kind === "failed" || prev?.kind === "not-sent" ? null : prev));
   }
 
   const connect = useCallback(() => openWallets(["stellar", "solana", "evm"]), [openWallets]);
@@ -843,12 +885,7 @@ export function StellarBridgeForm({
           reportError("stellar burn failed on chain", waitErr);
         }
       }
-      const nextReceipt = mapStellarBurnResult(
-        "PENDING",
-        waitOutcome,
-        hash,
-        env.stellarNetworkPassphrase,
-      );
+      const nextReceipt = mapStellarBurnResult(waitOutcome, hash, env.stellarNetworkPassphrase);
       setBurnReceipt(nextReceipt);
       if (nextReceipt.kind === "burned") {
         // Remembered once the burn is on chain, not when the field is filled: only an address that was
@@ -1029,6 +1066,25 @@ export function StellarBridgeForm({
         {burnReceipt?.kind === "failed" && (
           <Notice tone="alarm" title="Stellar did not accept the burn" className="mt-5">
             <p>{burnReceipt.message}</p>
+            <p className="mt-2">
+              <a
+                href={burnReceipt.explorerUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-bone/70 underline decoration-bone/25 underline-offset-[3px] transition-colors duration-200 ease-haptic hover:text-bone hover:decoration-bone/50"
+              >
+                View transaction on stellar.expert
+              </a>
+            </p>
+          </Notice>
+        )}
+
+        {burnReceipt?.kind === "not-sent" && (
+          <Notice tone="alarm" title="The burn was not sent" className="mt-5">
+            <p>{burnReceipt.message}</p>
+            <p className="tabular mt-2 break-all font-mono text-[0.75rem] text-bone/40">
+              {burnReceipt.txHash}
+            </p>
             <p className="mt-2">
               <a
                 href={burnReceipt.explorerUrl}

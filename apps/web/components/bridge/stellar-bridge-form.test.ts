@@ -11,6 +11,8 @@ vi.mock("./beneficiary-picker", () => ({ BeneficiaryPicker: () => null }));
 vi.mock("./use-beneficiaries", () => ({ useBeneficiaries: () => ({}) }));
 
 import {
+  STELLAR_BURN_TIMEBOUND_MS,
+  STELLAR_RECHECK_MAX_ROUNDS,
   classifyStellarWaitError,
   mapStellarBurnResult,
   pollPendingStellarBurn,
@@ -21,7 +23,7 @@ const SAMPLE_TX_HASH = "a".repeat(64);
 
 describe("mapStellarBurnResult", () => {
   it("transitions to a burned receipt and enables Circle polling once Stellar confirms", () => {
-    expect(mapStellarBurnResult("PENDING", "confirmed", SAMPLE_TX_HASH)).toEqual({
+    expect(mapStellarBurnResult("confirmed", SAMPLE_TX_HASH)).toEqual({
       kind: "burned",
       txHash: SAMPLE_TX_HASH,
       explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
@@ -30,7 +32,7 @@ describe("mapStellarBurnResult", () => {
   });
 
   it("maps an on-chain FAILED outcome to the plain-words alarm notice with explorer link and stops Circle polling", () => {
-    expect(mapStellarBurnResult("PENDING", "failed", SAMPLE_TX_HASH)).toEqual({
+    expect(mapStellarBurnResult("failed", SAMPLE_TX_HASH)).toEqual({
       kind: "failed",
       txHash: SAMPLE_TX_HASH,
       explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
@@ -40,14 +42,20 @@ describe("mapStellarBurnResult", () => {
     });
   });
 
+  it("maps an expired outcome to a not-sent notice with the hash and explorer link and unlocks retry", () => {
+    expect(mapStellarBurnResult("expired", SAMPLE_TX_HASH)).toEqual({
+      kind: "not-sent",
+      txHash: SAMPLE_TX_HASH,
+      explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
+      message:
+        "Stellar did not confirm the burn before its time bound expired, so it was not sent. No USDC left your wallet. It is safe to try again.",
+      pollCircle: false,
+    });
+  });
+
   it("maps a wait timeout to 'Waiting for Stellar to confirm' rather than polling Circle", () => {
     expect(
-      mapStellarBurnResult(
-        "PENDING",
-        "timeout",
-        SAMPLE_TX_HASH,
-        "Test SDF Network ; September 2015",
-      ),
+      mapStellarBurnResult("timeout", SAMPLE_TX_HASH, "Test SDF Network ; September 2015"),
     ).toEqual({
       kind: "waiting-stellar",
       txHash: SAMPLE_TX_HASH,
@@ -106,6 +114,7 @@ describe("pollPendingStellarBurn", () => {
       SAMPLE_TX_HASH,
       "Public Global Stellar Network ; September 2015",
       waitFn,
+      { round: 1, maxRounds: STELLAR_RECHECK_MAX_ROUNDS },
     );
     expect(first).toEqual({
       kind: "waiting-stellar",
@@ -120,6 +129,7 @@ describe("pollPendingStellarBurn", () => {
       SAMPLE_TX_HASH,
       "Public Global Stellar Network ; September 2015",
       waitFn,
+      { round: 2, maxRounds: STELLAR_RECHECK_MAX_ROUNDS },
     );
     expect(second).toEqual({
       kind: "burned",
@@ -153,5 +163,45 @@ describe("pollPendingStellarBurn", () => {
         "Stellar did not accept the burn. No USDC left your wallet. Only the network fee was spent.",
       pollCircle: false,
     });
+  });
+
+  it("stops re-checking once the round cap or transaction time bound is reached and marks the burn not-sent with the hash", async () => {
+    const waitFn = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(`Timed out after 15s waiting for ${SAMPLE_TX_HASH} to be applied.`),
+      );
+
+    const byRoundCap = await pollPendingStellarBurn(
+      { horizonUrl: "https://horizon.stellar.org" },
+      SAMPLE_TX_HASH,
+      "Public Global Stellar Network ; September 2015",
+      waitFn,
+      { round: STELLAR_RECHECK_MAX_ROUNDS, maxRounds: STELLAR_RECHECK_MAX_ROUNDS },
+    );
+    expect(byRoundCap).toEqual({
+      kind: "not-sent",
+      txHash: SAMPLE_TX_HASH,
+      explorerUrl: `https://stellar.expert/explorer/public/tx/${SAMPLE_TX_HASH}`,
+      message:
+        "Stellar did not confirm the burn before its time bound expired, so it was not sent. No USDC left your wallet. It is safe to try again.",
+      pollCircle: false,
+    });
+
+    const startMs = 1_000_000;
+    const byTimebound = await pollPendingStellarBurn(
+      { horizonUrl: "https://horizon.stellar.org" },
+      SAMPLE_TX_HASH,
+      "Public Global Stellar Network ; September 2015",
+      waitFn,
+      {
+        round: 1,
+        maxRounds: STELLAR_RECHECK_MAX_ROUNDS,
+        deadlineMs: startMs + STELLAR_BURN_TIMEBOUND_MS,
+        nowMs: startMs + STELLAR_BURN_TIMEBOUND_MS,
+      },
+    );
+    expect(byTimebound.kind).toBe("not-sent");
+    expect(byTimebound.txHash).toBe(SAMPLE_TX_HASH);
   });
 });
