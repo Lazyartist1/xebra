@@ -6,6 +6,7 @@ import {
   type DestinationId,
   type DomainForwardConfig,
   type FeeParams,
+  type MaxFeeChoice,
   STELLAR_CCTP_DOMAIN,
   chooseMaxFee,
   formatUsdc,
@@ -45,7 +46,12 @@ import { BeneficiaryPicker } from "./beneficiary-picker";
 import { ChainPicker, PickerLabel } from "./chain-picker";
 import { MaxAmount, QUICK_AMOUNTS, QuickAmount } from "./quick-amount";
 import { CopyButton, SubmittedNotice } from "./receipt";
-import { ArcRecipientPanel, RecipientPanel, UseMyWallet } from "./recipient-panels";
+import {
+  ArcRecipientPanel,
+  RecipientPanel,
+  SuiRecipientPanel,
+  UseMyWallet,
+} from "./recipient-panels";
 import { RouteTrack } from "./route-track";
 import { QuotePanel } from "./stellar-quote-panel";
 import { useBeneficiaries } from "./use-beneficiaries";
@@ -284,6 +290,39 @@ export async function pollPendingStellarBurn(
   }
 }
 
+/**
+ * The Circle fee a transfer to a claim-only chain signs: none. Circle quotes 0 for a Standard burn
+ * from Stellar to Sui (Iris `fees/27/8`, 2026-11-20), and nobody is paid to deliver it.
+ */
+const CLAIM_ONLY_FEE: MaxFeeChoice = { ok: true, maxFee: 0n };
+
+/** The receipt for a chain Circle does not deliver to: it ends at `/claim`, by design. */
+const CLAIM_ONLY_RECEIPT = {
+  intro:
+    "Circle signs the transfer within a few minutes. It does not deliver to Sui by itself, so once it is signed, the link below finishes it with any Sui wallet for a little SUI gas. Until then your USDC is safe and still yours.",
+  claimableLine: "Circle has signed it. One Sui transaction finishes it.",
+};
+
+/** Which kind of address a destination takes, for the recipient field and the wallet button. */
+function addressFamily(id: DestinationId): "solana" | "sui" | "evm" {
+  return id === "solana" || id === "sui" ? id : "evm";
+}
+
+/**
+ * Whether the contract's chosen path fits the destination. A delivered chain must be forwarded (a
+ * burn nobody delivers is not offered); a claim-only chain must not be (Circle would refuse the
+ * forward, and the transfer would sit unminted with the fee spent on a delivery that never comes).
+ */
+function pathProblem(forwarded: boolean, claimOnly: boolean, name: string): string | null {
+  if (claimOnly && forwarded) {
+    return `The bridge contract would ask Circle to deliver to ${name}, which Circle does not do.`;
+  }
+  if (!claimOnly && !forwarded) {
+    return `Automatic delivery to ${name} is not available for this transfer right now.`;
+  }
+  return null;
+}
+
 export function StellarBridgeForm({
   sourcePicker,
   onBusyChange,
@@ -361,6 +400,7 @@ export function StellarBridgeForm({
         arcEnabled: env.arcEnabled,
         sendsTo: env.stellarSendsTo,
         committed: domains ? new Set(domains.keys()) : null,
+        sui: env.stellarToSui,
       }),
     [domains],
   );
@@ -505,15 +545,17 @@ export function StellarBridgeForm({
   // contract's caps and switches. `null` until both are known.
   const feeChoice = useMemo(
     () =>
-      health?.quote && domainCfg
-        ? chooseMaxFee({
-            quote: health.quote,
-            needsAccount: recipientNeedsAccount,
-            cfg: domainCfg,
-            destinationName: dest.name,
-          })
-        : null,
-    [health, domainCfg, recipientNeedsAccount, dest.name],
+      dest.claimOnly
+        ? CLAIM_ONLY_FEE
+        : health?.quote && domainCfg
+          ? chooseMaxFee({
+              quote: health.quote,
+              needsAccount: recipientNeedsAccount,
+              cfg: domainCfg,
+              destinationName: dest.name,
+            })
+          : null,
+    [health, domainCfg, recipientNeedsAccount, dest.name, dest.claimOnly],
   );
   const maxFee = feeChoice?.ok ? feeChoice.maxFee : null;
   const feeRefusal = feeChoice && !feeChoice.ok ? feeChoice.reason : null;
@@ -522,7 +564,9 @@ export function StellarBridgeForm({
   // the route: about 1 USDC to Arc, nearer 2 to an existing Solana account, nearer 4 to a new one. Say so
   // before the person signs, instead of surfacing the contract's error code.
   const routeMinimum =
-    maxFee !== null && feeParams ? minimumForwardedAmount(maxFee, feeParams) : null;
+    maxFee !== null && feeParams && !dest.claimOnly
+      ? minimumForwardedAmount(maxFee, feeParams)
+      : null;
   const routeMinimumProblem =
     routeMinimum !== null &&
     maxFee !== null &&
@@ -569,11 +613,11 @@ export function StellarBridgeForm({
         .then((result) => {
           if (cancelled) return;
           // A transfer the contract would not forward is a burn nobody delivers; it is not offered.
-          if (!result.forwarded) {
+          // Except where nobody ever delivers (Sui): there the contract must *not* forward.
+          const problem = pathProblem(result.forwarded, dest.claimOnly, dest.name);
+          if (problem) {
             setQuote(null);
-            setQuoteError(
-              `Automatic delivery to ${dest.name} is not available for this transfer right now.`,
-            );
+            setQuoteError(problem);
             return;
           }
           setQuote(result);
@@ -607,6 +651,7 @@ export function StellarBridgeForm({
     healthUnavailable,
     routeMinimumProblem,
     dest.name,
+    dest.claimOnly,
   ]);
 
   // When initial confirmation timed out, keep polling Horizon until the transaction's time bound
@@ -725,6 +770,8 @@ export function StellarBridgeForm({
   // they may hold nothing on. Declining to start is free. Re-checked every minute while the page is
   // open, and again immediately before signing.
   useEffect(() => {
+    // Circle does not deliver to a claim-only chain, so there is no delivery to check on.
+    if (dest.claimOnly) return;
     let cancelled = false;
     const key = `${dest.domain}:${recipientNeedsAccount}`;
     const check = () =>
@@ -737,7 +784,7 @@ export function StellarBridgeForm({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [dest.domain, recipientNeedsAccount]);
+  }, [dest.domain, recipientNeedsAccount, dest.claimOnly]);
 
   // Read the wallet's USDC once it is connected.
   //
@@ -804,13 +851,16 @@ export function StellarBridgeForm({
     // Between EVM chains the address stays: the same key controls the same address on each, and
     // it is checked again against the new chain's own unsafe addresses. To or from Solana it is
     // cleared, because an address valid on one is never valid on the other.
-    if ((id === "solana") !== (destId === "solana")) setDestination("");
+    if (addressFamily(id) !== addressFamily(destId)) setDestination("");
     setDestId(id);
     setSubmitError(null);
     setBurnReceipt((prev) => (prev?.kind === "failed" || prev?.kind === "not-sent" ? null : prev));
   }
 
-  const connect = useCallback(() => openWallets(["stellar", "solana", "evm"]), [openWallets]);
+  const connect = useCallback(
+    () => openWallets(["stellar", "solana", "evm", "sui"]),
+    [openWallets],
+  );
 
   // Only a *known* shortfall blocks. An unread balance is not a zero balance.
   const shortfall =
@@ -822,7 +872,8 @@ export function StellarBridgeForm({
 
   const ready =
     Boolean(kit && address && quote && destinationCheck.ok && isCctpRailConfigured) &&
-    quote?.forwarded === true &&
+    quote !== null &&
+    pathProblem(quote.forwarded, dest.claimOnly, dest.name) === null &&
     shortfall === null &&
     health?.status !== "down" &&
     mintRecipient !== null &&
@@ -862,26 +913,28 @@ export function StellarBridgeForm({
         );
         return;
       }
-      const fresh = await getRouteHealth(STELLAR_CCTP_DOMAIN, dest.domain, recipientNeedsAccount);
-      setHealthState({ key: healthKey, value: fresh });
-      if (fresh?.status === "down") {
-        setSubmitError(
-          `Circle is not able to deliver to ${dest.name} right now, so nothing was sent. ${fresh.reasons[0] ?? ""}`.trim(),
-        );
-        return;
+      let choice: MaxFeeChoice = CLAIM_ONLY_FEE;
+      if (!dest.claimOnly) {
+        const fresh = await getRouteHealth(STELLAR_CCTP_DOMAIN, dest.domain, recipientNeedsAccount);
+        setHealthState({ key: healthKey, value: fresh });
+        if (fresh?.status === "down") {
+          setSubmitError(
+            `Circle is not able to deliver to ${dest.name} right now, so nothing was sent. ${fresh.reasons[0] ?? ""}`.trim(),
+          );
+          return;
+        }
+        // With no relay, a transfer signed without a live delivery fee is one nobody can deliver.
+        if (!fresh?.quote) {
+          setSubmitError("We could not get Circle's delivery fee just now, so nothing was sent.");
+          return;
+        }
+        choice = chooseMaxFee({
+          quote: fresh.quote,
+          needsAccount: recipientNeedsAccount,
+          cfg: withTableCeiling(latestCfg, dest.evm?.maxForwardFeeUnits ?? null),
+          destinationName: dest.name,
+        });
       }
-      // With no relay, a transfer signed without a live delivery fee is one nobody can deliver.
-      if (!fresh?.quote) {
-        setSubmitError("We could not get Circle's delivery fee just now, so nothing was sent.");
-        return;
-      }
-
-      const choice = chooseMaxFee({
-        quote: fresh.quote,
-        needsAccount: recipientNeedsAccount,
-        cfg: withTableCeiling(latestCfg, dest.evm?.maxForwardFeeUnits ?? null),
-        destinationName: dest.name,
-      });
       if (!choice.ok) {
         setSubmitError(choice.reason);
         return;
@@ -897,11 +950,10 @@ export function StellarBridgeForm({
         recipientNeedsAccount,
         choice.maxFee,
       );
-      if (!latest.forwarded) {
+      const problem = pathProblem(latest.forwarded, dest.claimOnly, dest.name);
+      if (problem) {
         setQuote(null);
-        setSubmitError(
-          `Automatic delivery to ${dest.name} is not available right now, so nothing was sent.`,
-        );
+        setSubmitError(`${problem} Nothing was sent.`);
         return;
       }
       if (latest.fee > quote.fee) {
@@ -956,7 +1008,8 @@ export function StellarBridgeForm({
       if (nextReceipt.kind === "burned") {
         // Remembered once the burn is on chain, not when the field is filled: only an address that was
         // actually sent to belongs in the list.
-        book.remember(dest.evm ? "evm" : "solana", destination);
+        const family = addressFamily(destId);
+        if (family !== "sui") book.remember(family, destination);
       }
     } catch (err) {
       setSubmitError(reportError("transfer failed", err));
@@ -1084,22 +1137,26 @@ export function StellarBridgeForm({
         </Field>
 
         <UseMyWallet
-          family={dest.evm ? "evm" : "solana"}
-          connection={dest.evm ? connections.evm : connections.solana}
+          family={addressFamily(destId)}
+          connection={connections[addressFamily(destId)]}
           disabled={submitting || Boolean(txHash)}
           onUse={setDestination}
           onConnect={openWallets}
         />
 
-        <BeneficiaryPicker
-          book={book}
-          family={dest.evm ? "evm" : "solana"}
-          address={destination}
-          disabled={submitting || Boolean(txHash)}
-          onPick={setDestination}
-        />
+        {addressFamily(destId) !== "sui" && (
+          <BeneficiaryPicker
+            book={book}
+            family={dest.evm ? "evm" : "solana"}
+            address={destination}
+            disabled={submitting || Boolean(txHash)}
+            onPick={setDestination}
+          />
+        )}
 
-        {dest.needsAccountResolution ? (
+        {dest.claimOnly ? (
+          <SuiRecipientPanel address={destination.trim()} valid={destinationCheck.ok} />
+        ) : dest.needsAccountResolution ? (
           <RecipientPanel
             resolving={resolving}
             recipient={recipient}
@@ -1119,6 +1176,7 @@ export function StellarBridgeForm({
           error={quoteError}
           hasAddress={Boolean(address)}
           destinationName={dest.name}
+          claimOnly={dest.claimOnly}
         />
 
         {shortfall !== null && (
@@ -1240,7 +1298,10 @@ export function StellarBridgeForm({
               txHash={burnReceipt.txHash}
               delivery={delivery}
               destination={stellarDestination(sentTo)}
-              route={{ burnUrl: burnReceipt.explorerUrl }}
+              route={{
+                ...(stellarDestination(sentTo).claimOnly ? CLAIM_ONLY_RECEIPT : {}),
+                burnUrl: burnReceipt.explorerUrl,
+              }}
             />
             {pollError && !stalled && (
               <Notice tone="alarm" title={pollError} className="mt-3">
